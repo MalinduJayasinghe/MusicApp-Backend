@@ -4,7 +4,6 @@ import { Playlist } from "../models/playlist.model"
 import { AuthRequest } from "../middleware/auth"
 import { parseTrack } from "../util/track"
 
-// Finds a playlist by id that belongs to the logged-in user
 const findOwned = (req: AuthRequest) => {
     const id = String(req.params.id)
     if (!mongoose.isValidObjectId(id)) return null
