@@ -1,8 +1,13 @@
 import { ITrack } from "../models/track.model"
 
 const YT_BASE = "https://www.googleapis.com/youtube/v3"
-const MUSIC_CATEGORY_ID = "10" // YouTube's "Music" category
-const MAX_DURATION_SECONDS = 15 * 60 // hide long mixes / live streams
+const MUSIC_CATEGORY_ID = "10"
+const MIN_DURATION_SECONDS = 45
+const MAX_DURATION_SECONDS = 15 * 60
+
+const CANDIDATES_PER_PAGE = 50
+const MIN_RESULTS = 12
+const MAX_SEARCH_PAGES = 3 // quota guard: each page costs 100 units
 
 export class YouTubeError extends Error {
     status: number
@@ -19,6 +24,7 @@ export interface SearchResult {
 }
 
 /* ---------------- tiny in-memory cache (saves API quota) ---------------- */
+
 const cache = new Map<string, { value: unknown; expires: number }>()
 
 const getCached = <T>(key: string): T | null => {
@@ -64,11 +70,47 @@ export const splitTitle = (rawTitle: string, channelTitle: string) => {
     return { artist: channel || channelTitle, title: cleaned || rawTitle }
 }
 
-export const toTrack = (item: any): ITrack | null => {
-    if (!item?.id || item.status?.embeddable === false) return null
+
+const MUSIC_TOPIC =
+    /wikipedia\.org\/wiki\/(Music|Music_of_[\w%-]+|[\w%-]+_music|Jazz|Reggae|Rhythm_and_blues)$/i
+
+
+const BLOCKED: RegExp[] = [
+    /\b(reaction|reacts?|reacting)\b/i,
+    /\b(tutorial|lessons?|how to)\b/i,
+    /\b(reviews?|unboxing)\b/i,
+    /\b(interview|podcast|documentary|behind the scenes|making of)\b/i,
+    /\b(trailer|teaser|gameplay|walkthrough|vlog|prank)\b/i,
+    /\b(compilation|megamix|non-?stop|full album)\b/i,
+    /\b(live ?stream(ing)?|24\/7)\b/i,
+    /\b(ringtone|whatsapp status|status video)\b/i
+]
+
+/* eslint-disable @typescript-eslint/no-explicit-any */
+export const isMusicContent = (item: any, query = ""): boolean => {
+    const snippet = item?.snippet
+    if (!item?.id || !snippet) return false
+
+    if (item.status?.embeddable === false) return false
+    if (item.status?.privacyStatus && item.status.privacyStatus !== "public") return false
+    if (snippet.liveBroadcastContent && snippet.liveBroadcastContent !== "none") return false
 
     const duration = parseDuration(item.contentDetails?.duration)
-    if (!duration || duration > MAX_DURATION_SECONDS) return null
+    if (duration < MIN_DURATION_SECONDS || duration > MAX_DURATION_SECONDS) return false
+
+    const topics: string[] = item.topicDetails?.topicCategories ?? []
+    const isMusic =
+        snippet.categoryId === MUSIC_CATEGORY_ID || topics.some((t) => MUSIC_TOPIC.test(t))
+    if (!isMusic) return false
+
+    if (/#shorts?\b/i.test(snippet.description ?? "")) return false
+
+    const text = `${snippet.title ?? ""} ${snippet.channelTitle ?? ""}`
+    return !BLOCKED.some((re) => re.test(text) && !re.test(query))
+}
+
+export const toTrack = (item: any, query = ""): ITrack | null => {
+    if (!isMusicContent(item, query)) return null
 
     const { artist, title } = splitTitle(
         item.snippet?.title ?? "",
@@ -85,7 +127,7 @@ export const toTrack = (item: any): ITrack | null => {
             thumbs.high?.url ||
             thumbs.default?.url ||
             `https://i.ytimg.com/vi/${item.id}/mqdefault.jpg`,
-        duration
+        duration: parseDuration(item.contentDetails?.duration)
     }
 }
 
@@ -118,16 +160,19 @@ const callYouTube = async (path: string, params: Record<string, string>) => {
     return body
 }
 
-const VIDEO_PARTS = "snippet,contentDetails,status"
+const VIDEO_PARTS = "snippet,contentDetails,status,topicDetails"
 
-const getTracksByIds = async (ids: string[]): Promise<ITrack[]> => {
+const getTracksByIds = async (ids: string[], query: string): Promise<ITrack[]> => {
     const body = await callYouTube("videos", {
         part: VIDEO_PARTS,
         id: ids.join(",")
     })
-    return (body.items as any[]).map(toTrack).filter((t): t is ITrack => !!t)
+    return (body.items as any[])
+        .map((item) => toTrack(item, query))
+        .filter((t): t is ITrack => !!t)
 }
 
+// search.list costs 100 quota units, videos.list costs 1 (free quota: 10,000/day)
 export const searchTracks = async (
     query: string,
     pageToken?: string
@@ -136,26 +181,41 @@ export const searchTracks = async (
     const cached = getCached<SearchResult>(cacheKey)
     if (cached) return cached
 
-    const search = await callYouTube("search", {
-        part: "snippet",
-        type: "video",
-        videoCategoryId: MUSIC_CATEGORY_ID,
-        videoEmbeddable: "true",
-        videoSyndicated: "true",
-        maxResults: "20",
-        q: query,
-        ...(pageToken ? { pageToken } : {})
-    })
+    const tracks: ITrack[] = []
+    const seen = new Set<string>()
+    let token = pageToken
+    let nextPageToken: string | null = null
 
-    const ids: string[] = (search.items as any[])
-        .map((item) => item.id?.videoId)
-        .filter(Boolean)
+    for (let page = 0; page < MAX_SEARCH_PAGES; page++) {
+        const search = await callYouTube("search", {
+            part: "snippet",
+            type: "video",
+            videoCategoryId: MUSIC_CATEGORY_ID,
+            videoEmbeddable: "true",
+            videoSyndicated: "true",
+            maxResults: String(CANDIDATES_PER_PAGE),
+            q: query,
+            ...(token ? { pageToken: token } : {})
+        })
 
-    const result: SearchResult = {
-        tracks: ids.length ? await getTracksByIds(ids) : [],
-        nextPageToken: search.nextPageToken || null
+        const ids: string[] = (search.items as any[])
+            .map((item) => item.id?.videoId)
+            .filter(Boolean)
+
+        const found = ids.length ? await getTracksByIds(ids, query) : []
+        for (const track of found) {
+            if (!seen.has(track.videoId)) {
+                seen.add(track.videoId)
+                tracks.push(track)
+            }
+        }
+
+        nextPageToken = search.nextPageToken || null
+        if (tracks.length >= MIN_RESULTS || !nextPageToken) break
+        token = nextPageToken
     }
 
+    const result: SearchResult = { tracks, nextPageToken }
     setCached(cacheKey, result, 10 * 60 * 1000)
     return result
 }
@@ -174,7 +234,7 @@ export const getTrendingTracks = async (): Promise<ITrack[]> => {
     })
 
     const tracks = (body.items as any[])
-        .map(toTrack)
+        .map((item) => toTrack(item))
         .filter((t): t is ITrack => !!t)
 
     setCached(cacheKey, tracks, 60 * 60 * 1000)
